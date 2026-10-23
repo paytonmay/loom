@@ -452,6 +452,25 @@ the state, provenance, roles and report, as a convenience for a reader that
 has not yet pulled the ops. It is unverified until they do, and the page
 says so.
 
+### Mirrors: cascading availability
+
+A page may carry several `<link rel="loom">` back-links, one per host that
+holds the ops (`loom publish --mirror <base>`, repeatable). Every verifier,
+the command line and the browser alike, reads all of them and takes the
+union: indexes are merged, and each blob is taken from the first source
+whose bytes match its hash. Because a host can withhold but never corrupt,
+adding a source can only make a document more complete. The outcome per
+source is reported as served, unreachable, or wrong content; only the last
+fails verification, since a host that returns bytes that do not match the
+hash is lying, and that is worth stopping for even when a mirror could cover
+for it.
+
+This is the first rung of cascading availability. Anyone who has pulled a
+document holds a complete copy and can serve it as a mirror by copying the
+folder to any host and asking the publisher to add the link. What it does
+not yet do is discover mirrors nobody announced; that is the gossip and
+incentive problem of section 12 and remains open.
+
 ### Verification in the reader's browser
 
 `publish` copies two files beside the ops: `loom/verify.js`, a JavaScript
@@ -603,7 +622,8 @@ or it loses to the incumbent. Section 8 holds the design; the steps:
 | 3c | Verification in the reader's browser; second implementation | done |
 | 4 | Dogfood: the project's status document live at https://paytonmay.github.io/loom/ | done |
 | 5 | Open-thread mode: ownerless messaging with provenance | done |
-| 6 | Cross-site capability grants (the network effect, last) | later |
+| 6 | Mirrors: several back-links, unioned by every verifier | done |
+| 7 | Cross-site capability grants (the network effect, last) | later |
 
 Key-loss recovery is addressed in section 6 (an offline admin key, granted
 at creation); browser-side verification in section 8. The first adopter is

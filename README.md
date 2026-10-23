@@ -35,6 +35,10 @@ Publishing on a site you already have, with no server code:
 ./loom.sh pull <doc> https://example.com/loom      # or pull into your own store
 ```
 
+Add `--mirror https://other.host/loom` (repeatable) to publish with extra
+back-links; verifiers and `pull` take the union of every source, so a host
+can withhold but never corrupt. `pull` accepts several relays too.
+
 The page links back to the signed ops with `<link rel="loom">` and carries a
 JavaScript verifier, so a browser checks every signature itself and shows a
 banner. A static host is a read-only relay: pushes to it fail with a

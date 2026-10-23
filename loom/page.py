@@ -31,10 +31,18 @@ def short(s: str) -> str:
     return hex_of(s)[:12] if s.startswith("sha256:") else s[:15]
 
 
-def render_html(doc: Document, relay_prefix: str = "loom/") -> str:
-    """A self-contained page: state with provenance, roles, verification report."""
+def render_html(doc: Document, relay_prefix: str = "loom/", mirrors: list[str] = ()) -> str:
+    """A self-contained page: state with provenance, roles, verification report.
+
+    `mirrors` are other relay bases (usually other hosts) holding the same ops;
+    each becomes another back-link, and verifiers take the union.
+    """
     e = html.escape
     href = loom_href(relay_prefix, doc.id)
+    mirror_hrefs = [loom_href(m, doc.id) for m in mirrors]
+    mirror_links = "".join(f'\n<link rel="loom" href="{e(m)}" type="text/plain">' for m in mirror_hrefs)
+    mirror_note = (f" Mirrors: {', '.join(f'<a href={chr(34)}{e(m)}{chr(34)}>{e(m)}</a>' for m in mirror_hrefs)}."
+                   if mirror_hrefs else "")
     state, prov, roles = doc.state(), doc.provenance(), doc.roles()
     rows = "".join(
         f"<tr><th>{e(k)}</th><td><code>{e(json.dumps(v, ensure_ascii=False))}</code></td>"
@@ -48,7 +56,7 @@ def render_html(doc: Document, relay_prefix: str = "loom/") -> str:
         for who, role in sorted(roles.items()))
     r = doc.report
     rejected = "".join(f"<li><code>{e(short(h))}</code>: {e(why)}</li>" for h, why in r.rejected)
-    machine = {"loom": 1, "id": doc.id, "title": doc.title(), "open": doc.open, "sealed": doc.sealed, "ops": href,
+    machine = {"loom": 1, "id": doc.id, "title": doc.title(), "open": doc.open, "sealed": doc.sealed, "ops": href, "mirrors": mirror_hrefs,
                "state": state, "provenance": prov, "roles": roles,
                "frontier": doc.frontier(),
                "report": {"seen": r.seen, "valid": r.valid, "sealed": r.sealed, "rejected": r.rejected}}
@@ -59,7 +67,7 @@ def render_html(doc: Document, relay_prefix: str = "loom/") -> str:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{e(doc.title() or short(doc.id))}</title>
-<link rel="loom" href="{e(href)}" type="text/plain">
+<link rel="loom" href="{e(href)}" type="text/plain">{mirror_links}
 <meta name="loom-document" content="{e(doc.id)}">
 <style>
  body{{font:16px/1.5 system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem;color:#222;background:#fff}}
@@ -86,7 +94,7 @@ def render_html(doc: Document, relay_prefix: str = "loom/") -> str:
 {f"<ul>{rejected}</ul>" if rejected else ""}
 <footer>
 <p>This page is a rendering, not the document. The document is the set of signed
-operations at <a href="{e(href)}">{e(href)}</a>. Anyone can fetch them and verify
+operations at <a href="{e(href)}">{e(href)}</a>.{mirror_note} Anyone can fetch them and verify
 every field, its author and its history with no trust in this host:
 <code>loom verify &lt;this page's URL&gt;</code>.</p>
 </footer>
@@ -113,16 +121,30 @@ class _LinkFinder(HTMLParser):
             self.hrefs.append(a["href"])
 
 
-def find_loom_link(page: str, page_url: str) -> tuple[str, str]:
-    """From a page's HTML, the (relay base, doc id) of its first loom back-link.
+def find_loom_links(page: str, page_url: str) -> tuple[list[str], str]:
+    """From a page's HTML, ([relay bases], doc id) of its loom back-links.
 
     `page_url` is where the page was fetched from; relative hrefs resolve against it.
+    All links must name the same document; links for another document are ignored.
     """
     f = _LinkFinder()
     f.feed(page)
+    bases, doc_id = [], None
     for href in f.hrefs:
         try:
-            return parse_loom_href(urljoin(page_url, href))
+            base, d = parse_loom_href(urljoin(page_url, href))
         except ValueError:
             continue
-    raise ValueError("page has no <link rel=\"loom\"> back-link")
+        if doc_id is None:
+            doc_id = d
+        if d == doc_id and base not in bases:
+            bases.append(base)
+    if doc_id is None:
+        raise ValueError("page has no <link rel=\"loom\"> back-link")
+    return bases, doc_id
+
+
+def find_loom_link(page: str, page_url: str) -> tuple[str, str]:
+    """The first back-link only; see find_loom_links."""
+    bases, doc_id = find_loom_links(page, page_url)
+    return bases[0], doc_id

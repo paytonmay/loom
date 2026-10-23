@@ -260,7 +260,7 @@ export class Document {
     return out;
   }
   roles() {
-    if (this.open) return {};
+    if (this.open || this.owner === null) return {};
     const roles = { [this.owner]: 'admin' };
     for (const h of this.order) {
       const op = this.valid.get(h);
@@ -284,20 +284,35 @@ export class Document {
 
 // ---- loading from a relay ------------------------------------------------
 
-// fetchBytes(relativePath) -> Uint8Array, or throws; null for "not found".
-export async function loadDocument(docId, fetchBytes) {
-  const index = await fetchBytes(`docs/${hexOf(docId)}`);
-  const hashes = index === null ? [] : td.decode(index).split('\n').map((s) => s.trim()).filter(isHash);
-  const ops = new Map();
-  await Promise.all(hashes.map(async (h) => {
-    let op = null;
+// Each source is fetchBytes(relativePath) -> Uint8Array, or throws; null for "not found".
+// Several sources are unioned: a source can withhold, never corrupt, so more is better.
+// Returns the Document plus one outcome per source.
+export async function loadDocument(docId, sources) {
+  if (typeof sources === 'function') sources = [sources];
+  const hashes = new Set();
+  const outcomes = [];
+  await Promise.all(sources.map(async (fetchBytes, i) => {
     try {
-      const bytes = await fetchBytes(`blobs/${hexOf(h)}`);
-      if (bytes !== null && hashBytes(bytes) === h) op = JSON.parse(td.decode(bytes));
-    } catch { op = null; }
+      const index = await fetchBytes(`docs/${hexOf(docId)}`);
+      const list = index === null ? [] : td.decode(index).split('\n').map((s) => s.trim()).filter(isHash);
+      for (const h of list) hashes.add(h);
+      outcomes[i] = `${list.length} listed`;
+    } catch (e) { outcomes[i] = `unreachable: ${e.message}`; }
+  }));
+  const ops = new Map();
+  await Promise.all([...hashes].map(async (h) => {
+    let op = null;
+    for (const fetchBytes of sources) {       // first source whose bytes match the hash wins
+      try {
+        const bytes = await fetchBytes(`blobs/${hexOf(h)}`);
+        if (bytes !== null && hashBytes(bytes) === h) { op = JSON.parse(td.decode(bytes)); break; }
+      } catch { /* try the next source */ }
+    }
     ops.set(h, op);
   }));
-  return new Document(docId, ops);
+  const doc = new Document(docId, ops);
+  doc.sources = outcomes;
+  return doc;
 }
 
 export function parseLoomHref(href) {
@@ -312,23 +327,28 @@ export function parseLoomHref(href) {
 const same = (a, b) => canonical(a) === canonical(b);
 
 export async function verifyPage(doc = globalThis.document) {
-  const link = doc.querySelector('link[rel~="loom"]');
-  if (!link) return;
+  const links = [...doc.querySelectorAll('link[rel~="loom"]')];
+  if (!links.length) return;
   const banner = doc.getElementById('loom-verify') || doc.body.insertBefore(doc.createElement('div'), doc.body.firstChild);
   banner.id = 'loom-verify';
   const show = (cls, text) => { banner.className = 'loom-' + cls; banner.textContent = text; };
   show('pending', 'Verifying the signed document in your browser…');
   try {
-    const { base, docId } = parseLoomHref(new URL(link.getAttribute('href'), doc.baseURI).href);
-    const fetchBytes = async (rel) => {
+    const parsed = links.map((l) => { try { return parseLoomHref(new URL(l.getAttribute('href'), doc.baseURI).href); } catch { return null; } }).filter(Boolean);
+    if (!parsed.length) throw new Error('no usable back-link');
+    const docId = parsed[0].docId;
+    const bases = [...new Set(parsed.filter((p) => p.docId === docId).map((p) => p.base))];
+    const sources = bases.map((base) => async (rel) => {
       const r = await fetch(`${base}/${rel}`, { cache: 'no-store' });
       if (r.status === 404) return null;
       if (!r.ok) throw new Error(`${r.status} fetching ${rel}`);
       return new Uint8Array(await r.arrayBuffer());
-    };
-    const d = await loadDocument(docId, fetchBytes);
+    });
+    const d = await loadDocument(docId, sources);
     const r = d.report;
-    const counts = `${r.seen} ops fetched, ${r.valid} valid, ${r.rejected.length} rejected`;
+    const reached = d.sources.filter((o) => !o.startsWith('unreachable')).length;
+    const counts = `${r.seen} ops fetched, ${r.valid} valid, ${r.rejected.length} rejected`
+      + (bases.length > 1 ? `, ${reached} of ${bases.length} sources reached` : '');
     if (d.owner === null) return show('bad', `Not a verifiable document: genesis missing. ${counts}.`);
     if (d.sealed) return show('ok', `Sealed document verified in your browser: ${r.sealed} signed, encrypted operation(s). ${counts}. Contents need the read key.`);
     const embedded = doc.getElementById('loom');
@@ -341,20 +361,20 @@ export async function verifyPage(doc = globalThis.document) {
   }
 }
 
-// ---- under node: node verify.js <relay dir> <doc id> ---------------------
+// ---- under node: node verify.js <relay dir>[,<relay dir>...] <doc id> ----
 
 const isNode = typeof process !== 'undefined' && process.versions?.node;
 if (isNode && process.argv[1] && import.meta.url.endsWith(process.argv[1].split('/').pop())) {
   const fs = await import('node:fs/promises');
   const path = await import('node:path');
-  const [dir, docId] = process.argv.slice(2);
-  if (!dir || !isHash(docId)) { console.error('usage: node verify.js <relay dir> <sha256:doc id>'); process.exit(2); }
-  const fetchBytes = async (rel) => {
+  const [dirs, docId] = process.argv.slice(2);
+  if (!dirs || !isHash(docId)) { console.error('usage: node verify.js <relay dir>[,<relay dir>...] <sha256:doc id>'); process.exit(2); }
+  const sources = dirs.split(',').map((dir) => async (rel) => {
     try { return new Uint8Array(await fs.readFile(path.join(dir, rel))); }
     catch (e) { if (e.code === 'ENOENT') return null; throw e; }
-  };
-  const d = await loadDocument(docId, fetchBytes);
-  console.log(JSON.stringify(d.summary(), null, 2));
+  });
+  const d = await loadDocument(docId, sources);
+  console.log(JSON.stringify({ ...d.summary(), sources: d.sources }, null, 2));
   process.exit(d.owner === null ? 1 : 0);
 } else if (typeof globalThis.document !== 'undefined') {
   if (globalThis.document.readyState === 'loading') globalThis.document.addEventListener('DOMContentLoaded', () => verifyPage());

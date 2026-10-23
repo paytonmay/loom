@@ -56,6 +56,15 @@ trap 'kill $RELAY $SITE 2>/dev/null' EXIT
 say "anyone verifies the page from its URL; the dumb file server is a read-only relay"
 $LOOM verify http://127.0.0.1:7701/index.html
 
+say "a mirror: the page lists two hosts; the first withholds an op, the second has it"
+LOOM_HOME=$A $LOOM publish $DOC demo-run/mirror >/dev/null
+python3 -m http.server 7703 -d demo-run/mirror >/dev/null 2>&1 & MIRROR=$!
+sleep 1
+trap 'kill $RELAY $SITE $MIRROR 2>/dev/null' EXIT
+LOOM_HOME=$A $LOOM publish $DOC demo-run/site --page index.html --mirror http://127.0.0.1:7703/loom >/dev/null
+rm "demo-run/site/loom/blobs/$(ls demo-run/site/loom/blobs | tail -1)"
+$LOOM verify http://127.0.0.1:7701/index.html | head -3
+
 say "dave pulls through the same host, then tries to push to it"
 rm -rf demo-run/dave
 LOOM_HOME=demo-run/dave $LOOM pull $DOC http://127.0.0.1:7701/loom

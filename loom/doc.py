@@ -222,7 +222,7 @@ class Document:
 
     def roles(self) -> dict[str, str]:
         """Capability table as of the full valid history. Empty for an open thread."""
-        if self.open:
+        if self.open or self.owner is None:
             return {}
         roles = {self.owner: ROLE_ADMIN}
         for h in self.order:

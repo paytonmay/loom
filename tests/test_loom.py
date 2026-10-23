@@ -294,7 +294,7 @@ def test_publish_page_then_verify_from_url_and_file(tmp_path, keys, capsys):
     try:
         url = f"http://127.0.0.1:{server.server_address[1]}/index.html"
         main(["verify", url, "--json"])
-        got = json.loads(capsys.readouterr().out.split("\n", 1)[1])
+        got = json.loads(capsys.readouterr().out)
         assert got["state"] == {"greeting": "hi <there>"} and got["report"]["valid"] == 2
 
         # a tampered blob on the host is caught, not trusted, even though the page looks fine
@@ -389,8 +389,8 @@ def test_javascript_verifier_agrees_with_python(tmp_path, keys, capsys, monkeypa
     assert sorted(map(tuple, got["report"]["rejected"])) == sorted(py.report.rejected)
     assert len(py.report.rejected) == 2
 
-    # tamper with a blob on the "host": both implementations reject exactly that op
-    blob = sorted((site / "loom" / "blobs").iterdir())[0]
+    # tamper with a non-genesis blob on the "host": both implementations reject exactly that op
+    blob = next(b for b in sorted((site / "loom" / "blobs").iterdir()) if b.name != d[7:])
     blob.write_bytes(blob.read_bytes().replace(b'"v":1', b'"v":1 '))
     got = js()
     py2 = Document.load(Store(site / "loom"), d)
@@ -630,3 +630,67 @@ def test_javascript_verifier_agrees_on_sealed_documents(tmp_path, keys, capsys, 
     assert got["sealed"] is True and got["state"] == {} == py.state()
     assert got["report"]["valid"] == py.report.valid == 4 and got["report"]["sealed"] == py.report.sealed == 3
     assert sorted(map(tuple, got["report"]["rejected"])) == sorted(py.report.rejected) == [(h, "unsealed action in a sealed document")]
+
+
+# ---- mirrors: a host can withhold, never corrupt; sources are unioned -----
+
+def _static(site):
+    handler = partial(SimpleHTTPRequestHandler, directory=str(site))
+    handler.log_message = lambda *_: None
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def test_mirrors_fill_gaps_and_a_lying_host_fails_verification(tmp_path, keys, capsys, monkeypatch):
+    import subprocess, shutil
+    from loom.cli import main
+    from loom.page import find_loom_links
+    a = keys["alice"]
+    home = tmp_path / "home"; a.save(home)
+    sa = Store(home / "store")
+    d = create_document(sa, a, "mirrored")
+    for i in range(4):
+        append(sa, a, d, set_action(f"k{i}", i))
+    monkeypatch.setenv("LOOM_HOME", str(home))
+    primary, mirror = tmp_path / "primary", tmp_path / "mirror"
+    mserver, murl = _static(mirror)
+    pserver, purl = _static(primary)
+    try:
+        main(["publish", d, str(mirror)])
+        main(["publish", d, str(primary), "--page", "index.html", "--mirror", f"{murl}/loom"])
+        capsys.readouterr()
+        page = (primary / "index.html").read_text()
+        assert page.count('rel="loom"') == 2
+        bases, doc_id = find_loom_links(page, f"{purl}/index.html")
+        assert bases == [f"{purl}/loom", f"{murl}/loom"] and doc_id == d
+
+        # the primary withholds two blobs; the mirror has them
+        blobs = sorted((primary / "loom" / "blobs").iterdir())
+        blobs[0].unlink(); blobs[1].unlink()
+        main(["verify", f"{purl}/index.html"])
+        out = capsys.readouterr().out
+        assert "ops seen 5, valid 5" in out and "2 source(s)" in out
+
+        # the mirror is down: still verifies what the primary has, says the mirror was unreachable
+        mserver.shutdown(); mserver.server_close()
+        main(["verify", f"{purl}/index.html"])
+        out = capsys.readouterr().out
+        assert "unreachable" in out and "ops seen 3" in out
+
+        # the primary lies about a blob: verification fails even though the content is otherwise fine
+        blobs[2].write_bytes(b'{"forged":true}')
+        with pytest.raises(SystemExit, match="does not match its hash"):
+            main(["verify", f"{purl}/index.html"])
+
+        # pull from several relays at once
+        main(["pull", d, str(primary / "loom"), str(mirror / "loom")])
+        assert "2 source(s)" in capsys.readouterr().out
+
+        if shutil.which("node"):
+            r = subprocess.run(["node", str(primary / "loom" / "verify.js"),
+                                f"{primary / 'loom'},{mirror / 'loom'}", d], capture_output=True, text=True)
+            got = json.loads(r.stdout)
+            assert got["report"]["valid"] == 5 and len(got["sources"]) == 2   # the mirror supplies what the primary lacks or forged
+    finally:
+        pserver.shutdown()

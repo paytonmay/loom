@@ -15,9 +15,9 @@ from .canon import hex_of
 from .doc import Document, create_document, append
 from .identity import Identity, identity_id
 from .ops import set_action, del_action, grant_action, revoke_action, action_kind, ROLE_ADMIN, ROLE_WRITE, new_read_key, READ_KEY_BYTES
-from .page import render_html, find_loom_link
+from .page import render_html, find_loom_links
 from .store import Store
-from .sync import open_relay, push, pull, serve, DirRelay
+from .sync import open_relay, push, pull, pull_many, serve, DirRelay
 
 
 def home() -> Path:
@@ -178,7 +178,7 @@ def print_doc(doc: Document, as_json: bool = False):
         return
     flags = ("  (open thread)" if doc.open else "") + ("  (sealed)" if doc.sealed else "")
     print(f"document {short(doc.id)}  \"{doc.title()}\"{flags}")
-    print(f"{'started' if doc.open else 'owner  '}  {short(doc.owner)}")
+    print(f"{'started' if doc.open else 'owner  '}  {short(doc.owner) if doc.owner else 'none (no valid genesis)'}")
     print()
     state, prov = doc.state(), doc.provenance()
     if doc.locked:
@@ -272,8 +272,13 @@ def cmd_push(args):
 def cmd_pull(args):
     store = Store(home() / "store")
     doc = args.doc if args.doc.startswith("sha256:") and len(args.doc) == 71 else store.resolve_doc(args.doc)
-    n = pull(store, doc, open_relay(args.relay))
-    print(f"pulled {n} op(s)")
+    if len(args.relay) == 1:
+        print(f"pulled {pull(store, doc, open_relay(args.relay[0]))} op(s)")
+        return
+    n, outcomes = pull_many(store, doc, [open_relay(r) for r in args.relay])
+    print(f"pulled {n} op(s) from {len(args.relay)} source(s)")
+    for name, outcome in outcomes:
+        print(f"  {name}: {outcome}")
 
 
 def cmd_publish(args):
@@ -287,46 +292,58 @@ def cmd_publish(args):
     doc = Document.load(store, doc_id)  # never with the read key: a published page holds no plaintext
     page = site / (args.page or f"{short(doc_id)}.html")
     page.parent.mkdir(parents=True, exist_ok=True)
-    page.write_text(render_html(doc, args.relay_dir + "/"))
-    print(f"pushed {n} op(s) to {site / args.relay_dir}\nwrote {page}")
+    page.write_text(render_html(doc, args.relay_dir + "/", args.mirror or []))
+    print(f"pushed {n} op(s) to {site / args.relay_dir}\nwrote {page}"
+          + (f"\nmirrors: {', '.join(args.mirror)}" if args.mirror else ""))
+
+
+def _relay_for(base: str):
+    if base.startswith("file://"):
+        return DirRelay(Path(url2pathname(urlparse(base).path)))
+    return open_relay(base)
 
 
 def resolve_verify_target(target: str, doc_arg: str | None):
-    """Turn what the user pointed at into (relay, doc id).
+    """Turn what the user pointed at into ([relays], doc id).
 
-    Accepts: a page URL with a <link rel="loom">, a relay URL plus a doc id,
-    a local .html file, or a folder plus a doc id.
+    Accepts: a page URL with <link rel="loom"> back-links (every link becomes a
+    source), a relay URL plus a doc id, a local .html file, or a folder plus a doc id.
     """
     if target.startswith(("http://", "https://")):
         with request.urlopen(target, timeout=15) as r:
             body = r.read(16 * 1024 * 1024)
             ctype = r.headers.get("Content-Type", "")
         if "html" in ctype or body.lstrip().startswith(b"<"):
-            base, doc_id = find_loom_link(body.decode("utf-8", "replace"), target)
-            return open_relay(base), doc_id
+            bases, doc_id = find_loom_links(body.decode("utf-8", "replace"), target)
+            return [_relay_for(b) for b in bases], doc_id
         if not doc_arg:
             raise ValueError(f"{target} is a relay, not a page; give the document id too")
-        return open_relay(target), doc_arg
+        return [open_relay(target)], doc_arg
     path = Path(target)
     if path.is_file():
-        base, doc_id = find_loom_link(path.read_text(), path.resolve().as_uri())
-        return DirRelay(Path(url2pathname(urlparse(base).path))), doc_id
+        bases, doc_id = find_loom_links(path.read_text(), path.resolve().as_uri())
+        return [_relay_for(b) for b in bases], doc_id
     if not doc_arg:
         raise ValueError(f"{target} is a folder, not a page; give the document id too")
-    return DirRelay(path), doc_arg
+    return [DirRelay(path)], doc_arg
 
 
 def cmd_verify(args):
     """Fetch a document into a scratch store and report on it. Touches nothing in LOOM_HOME."""
-    relay, doc_id = resolve_verify_target(args.target, args.doc)
+    relays, doc_id = resolve_verify_target(args.target, args.doc)
     if not (doc_id.startswith("sha256:") and len(doc_id) == 71):
         raise ValueError("verify needs a full document id")
     with tempfile.TemporaryDirectory() as tmp:
         store = Store(Path(tmp) / "store")
-        n = pull(store, doc_id, relay)
+        n, outcomes = pull_many(store, doc_id, relays)
         doc = Document.load(store, doc_id, bytes.fromhex(args.readkey) if args.readkey else None)
-        print(f"fetched {n} op(s)")
+        log = sys.stderr if args.json else sys.stdout  # keep --json output pure JSON
+        print(f"fetched {n} op(s) from {len(relays)} source(s)", file=log)
+        for name, outcome in outcomes:
+            print(f"  {name}: {outcome}", file=log)
         print_doc(doc, args.json)
+        if any(o.startswith("wrong content") for _, o in outcomes):
+            sys.exit("a source returned content that does not match its hash; see above")
         if doc.owner is None:
             sys.exit("no valid genesis: this is not a verifiable document")
 
@@ -361,8 +378,8 @@ def main(argv=None):
     s = sub.add_parser("log", help="list valid ops in causal order"); s.add_argument("doc"); s.set_defaults(fn=cmd_log)
     s = sub.add_parser("docs", help="list documents in this store"); s.set_defaults(fn=cmd_docs)
     s = sub.add_parser("push", help="send ops to a relay: a folder (publish it anywhere as static files) or an http URL"); s.add_argument("doc"); s.add_argument("relay"); s.set_defaults(fn=cmd_push)
-    s = sub.add_parser("pull", help="fetch ops from a relay: a folder, a `loom serve` URL, or any static host serving a pushed folder"); s.add_argument("doc", help="full id for a document you do not have yet"); s.add_argument("relay"); s.set_defaults(fn=cmd_pull)
-    s = sub.add_parser("publish", help="push to <site>/loom and write an HTML page with a back-link to the ops"); s.add_argument("doc"); s.add_argument("site", help="folder to publish as static files"); s.add_argument("--page", help="page file name inside <site> (default: <doc prefix>.html)"); s.add_argument("--relay-dir", default="loom", help="relay folder name inside <site> (default: loom)"); s.set_defaults(fn=cmd_publish)
+    s = sub.add_parser("pull", help="fetch ops from a relay: a folder, a `loom serve` URL, or any static host serving a pushed folder"); s.add_argument("doc", help="full id for a document you do not have yet"); s.add_argument("relay", nargs="+", help="one or more; the union is kept"); s.set_defaults(fn=cmd_pull)
+    s = sub.add_parser("publish", help="push to <site>/loom and write an HTML page with a back-link to the ops"); s.add_argument("doc"); s.add_argument("site", help="folder to publish as static files"); s.add_argument("--page", help="page file name inside <site> (default: <doc prefix>.html)"); s.add_argument("--relay-dir", default="loom", help="relay folder name inside <site> (default: loom)"); s.add_argument("--mirror", action="append", metavar="URL", help="another relay base holding this document; repeatable"); s.set_defaults(fn=cmd_publish)
     s = sub.add_parser("verify", help="fetch a document from a page URL, .html file, relay URL or folder, and verify it"); s.add_argument("target"); s.add_argument("doc", nargs="?", help="full document id (needed when target is a relay, not a page)"); s.add_argument("--json", action="store_true"); s.add_argument("--readkey", help="hex read key for a sealed document"); s.set_defaults(fn=cmd_verify)
     s = sub.add_parser("serve", help="run an HTTP relay"); s.add_argument("dir"); s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=7700); s.set_defaults(fn=cmd_serve)
 

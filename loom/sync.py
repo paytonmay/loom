@@ -109,13 +109,49 @@ def push(store: Store, doc_id: str, relay) -> int:
 
 
 def pull(store: Store, doc_id: str, relay) -> int:
+    """Fetch what we lack. Every good blob is kept even if some are bad; a bad
+    one is reported at the end, so another source can supply it."""
     missing = relay.list(doc_id) - store.doc_ops(doc_id)
+    bad, got = [], 0
     for h in sorted(missing):
-        data = relay.get(h)
-        if sha256(data) != h:
-            raise ValueError(f"relay returned wrong content for {h}")
-        accept_blob(store, data)
-    return len(missing)
+        try:
+            data = relay.get(h)
+        except (FileNotFoundError, error.HTTPError) as e:
+            if isinstance(e, error.HTTPError) and e.code != 404:
+                raise
+            continue  # listed but withheld: a gap another source may fill
+        try:
+            if sha256(data) != h:
+                raise ValueError("wrong content")
+            accept_blob(store, data)
+            got += 1
+        except ValueError as e:
+            bad.append((h, str(e)))
+    if bad:
+        raise ValueError(f"relay returned wrong content for {bad[0][0]}"
+                         + (f" and {len(bad) - 1} more" if len(bad) > 1 else ""))
+    return got
+
+
+def pull_many(store: Store, doc_id: str, relays: list) -> tuple[int, list[tuple[str, str]]]:
+    """Pull from every relay and keep the union. A relay can withhold, never corrupt,
+    so more sources can only make the document more complete.
+    Returns (ops added, [(relay, outcome)])."""
+    before = store.doc_ops(doc_id)
+    outcomes = []
+    for relay in relays:
+        try:
+            n = pull(store, doc_id, relay)
+            outcomes.append((relay_name(relay), f"{n} new"))
+        except ValueError as e:      # lying: wrong content for a hash
+            outcomes.append((relay_name(relay), f"wrong content: {str(e)[:60]}"))
+        except Exception as e:       # unreachable, timed out, refused
+            outcomes.append((relay_name(relay), f"unreachable: {str(e)[:60]}"))
+    return len(store.doc_ops(doc_id) - before), outcomes
+
+
+def relay_name(relay) -> str:
+    return relay.base if isinstance(relay, HttpRelay) else str(relay.store.root)
 
 
 # ---- HTTP relay server --------------------------------------------------
