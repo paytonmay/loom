@@ -67,3 +67,5 @@ on one machine use two homes.
 
 Layout: `loom/` is the code, `tests/` the tests, `DESIGN.md` the design,
 `docs/` the published site that GitHub Pages serves (the live example above).
+
+License: MIT. The bundled `loom/static/mldsa.js` is from the noble libraries, also MIT.
