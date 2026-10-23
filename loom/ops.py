@@ -1,4 +1,9 @@
 """Build, sign, and verify a single operation."""
+import json
+import os
+
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
 from .canon import canonical, hash_obj, is_hash, CanonError
 from .identity import Identity, identity_id, verify, b64e, b64d
 
@@ -6,7 +11,9 @@ VERSION = 1
 ROLE_WRITE = "write"
 ROLE_ADMIN = "admin"
 ROLES = (ROLE_WRITE, ROLE_ADMIN)
-ACTIONS = ("genesis", "set", "del", "grant", "revoke")
+ACTIONS = ("genesis", "set", "del", "grant", "revoke", "sealed")
+INNER_ACTIONS = ("set", "del", "grant", "revoke")   # what a sealed action may contain
+READ_KEY_BYTES = 32
 
 
 def signing_bytes(op: dict) -> bytes:
@@ -94,8 +101,18 @@ def verify_op(op) -> tuple[bool, str]:
 def _check_action(kind: str, body) -> tuple[bool, str]:
     if kind == "genesis":
         if not (isinstance(body, dict) and isinstance(body.get("title", ""), str)
-                and isinstance(body.get("open", False), bool)):
-            return False, "genesis body must be an object with optional string title and bool open"
+                and isinstance(body.get("open", False), bool)
+                and isinstance(body.get("sealed", False), bool)):
+            return False, "genesis body must be an object with optional string title and bools open, sealed"
+    elif kind == "sealed":
+        if not (isinstance(body, dict) and set(body) == {"nonce", "ct"}
+                and isinstance(body["nonce"], str) and isinstance(body["ct"], str)):
+            return False, "sealed needs nonce, ct"
+        try:
+            if len(b64d(body["nonce"])) != 12 or len(b64d(body["ct"])) < 16:
+                return False, "sealed nonce must be 12 bytes and ct at least a tag"
+        except Exception:
+            return False, "sealed nonce or ct is not base64"
     elif kind == "set":
         if not isinstance(body, str):
             return False, "set key must be a string"
@@ -133,11 +150,52 @@ def revoke_action(who: str) -> dict:
     return {"revoke": {"id": who}}
 
 
-def genesis_action(title: str, open: bool = False) -> dict:
+def genesis_action(title: str, open: bool = False, sealed: bool = False) -> dict:
     body = {"title": title}
     if open:
         body["open"] = True
+    if sealed:
+        body["sealed"] = True
     return {"genesis": body}
+
+
+# ---- read capability: the action is encrypted, the envelope is not --------
+
+def _aad(doc: str, author: str, seq: int) -> bytes:
+    """Binds a ciphertext to its op so it cannot be re-used in another."""
+    return canonical({"doc": doc, "author": author, "seq": seq})
+
+
+def new_read_key() -> bytes:
+    return os.urandom(READ_KEY_BYTES)
+
+
+def seal_action(key: bytes, doc: str, author: str, seq: int, inner: dict) -> dict:
+    """Encrypt an inner action (set/del/grant/revoke) under the document's read key."""
+    if action_kind(inner) not in INNER_ACTIONS:
+        raise ValueError("only set, del, grant, revoke can be sealed")
+    nonce = os.urandom(12)
+    ct = ChaCha20Poly1305(key).encrypt(nonce, canonical(inner), _aad(doc, author, seq))
+    return {"sealed": {"nonce": b64e(nonce), "ct": b64e(ct)}}
+
+
+def unseal_action(key: bytes, doc: str, author: str, seq: int, sealed: dict) -> dict:
+    """Decrypt and validate the inner action. Raises ValueError on wrong key, tampering, or bad content."""
+    try:
+        pt = ChaCha20Poly1305(key).decrypt(b64d(sealed["nonce"]), b64d(sealed["ct"]), _aad(doc, author, seq))
+    except Exception:
+        raise ValueError("cannot unseal: wrong read key or tampered")
+    try:
+        inner = json.loads(pt)
+    except (ValueError, RecursionError):
+        raise ValueError("sealed content is not JSON")
+    kinds = [k for k in INNER_ACTIONS if isinstance(inner, dict) and k in inner]
+    if len(kinds) != 1 or set(inner) != ({kinds[0]} | ({"value"} if kinds[0] == "set" else set())):
+        raise ValueError("sealed content is not a single inner action")
+    ok, why = _check_action(kinds[0], inner[kinds[0]])
+    if not ok:
+        raise ValueError(f"sealed content invalid: {why}")
+    return inner
 
 
 def own_key(author: str, key: str) -> bool:

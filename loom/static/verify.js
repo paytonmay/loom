@@ -12,7 +12,7 @@ import { ml_dsa44, sha256 } from './mldsa.js';
 
 const PREFIX = 'sha256:';
 const VERSION = 1;
-const ACTIONS = ['genesis', 'set', 'del', 'grant', 'revoke'];
+const ACTIONS = ['genesis', 'set', 'del', 'grant', 'revoke', 'sealed'];
 const ROLES = ['write', 'admin'];
 const te = new TextEncoder();
 const td = new TextDecoder();
@@ -76,8 +76,14 @@ const signingBytes = (op) => { const { sig, ...rest } = op; return te.encode(can
 function checkAction(kind, body) {
   if (kind === 'genesis') {
     if (!(body && typeof body === 'object' && !Array.isArray(body) && (body.title === undefined || typeof body.title === 'string')
-          && (body.open === undefined || typeof body.open === 'boolean')))
-      return [false, 'genesis body must be an object with optional string title and bool open'];
+          && (body.open === undefined || typeof body.open === 'boolean')
+          && (body.sealed === undefined || typeof body.sealed === 'boolean')))
+      return [false, 'genesis body must be an object with optional string title and bools open, sealed'];
+  } else if (kind === 'sealed') {
+    if (!(body && typeof body === 'object' && sameSet(Object.keys(body), ['nonce', 'ct'])
+          && typeof body.nonce === 'string' && typeof body.ct === 'string')) return [false, 'sealed needs nonce, ct'];
+    try { if (b64d(body.nonce).length !== 12 || b64d(body.ct).length < 16) return [false, 'sealed nonce must be 12 bytes and ct at least a tag']; }
+    catch { return [false, 'sealed nonce or ct is not base64']; }
   } else if (kind === 'set' || kind === 'del') {
     if (typeof body !== 'string') return [false, `${kind} key must be a string`];
   } else if (kind === 'grant') {
@@ -134,9 +140,10 @@ export class Document {
     this.ops = ops;
     this.valid = new Map();
     this.order = [];
-    this.report = { seen: ops.size, valid: 0, rejected: [] };
+    this.report = { seen: ops.size, valid: 0, sealed: 0, rejected: [] };
     this.owner = null;
     this.open = false;              // open thread: no capability table, own keys only
+    this.sealed = false;            // read capability: actions are encrypted; no key here
     this._ancestors = new Map();
     this._authorized = new Map();
     this._verify();
@@ -158,7 +165,15 @@ export class Document {
     }
     if (!structural.has(this.id)) { this._reject(this.id, 'genesis missing'); return; }
     this.owner = structural.get(this.id).author;
-    this.open = structural.get(this.id).action.genesis.open === true;
+    const genesis = structural.get(this.id).action.genesis;
+    this.open = genesis.open === true;
+    this.sealed = genesis.sealed === true;
+    for (const [h, op] of [...structural]) {
+      if (h === this.id) continue;
+      const kind = actionKind(op.action);
+      if (this.sealed && kind !== 'sealed') { this._reject(h, 'unsealed action in a sealed document'); structural.delete(h); }
+      else if (!this.sealed && kind === 'sealed') { this._reject(h, 'sealed action in an unsealed document'); structural.delete(h); }
+    }
 
     const kept = new Map();
     for (const h of [...structural.keys()].sort(byLamportThenHash(structural))) {
@@ -204,6 +219,7 @@ export class Document {
     const kind = actionKind(op.action);
     let ok;
     if (kind === 'genesis') ok = h === this.id;
+    else if (kind === 'sealed') { ok = true; this.report.sealed += 1; }  // envelope valid, content unknown
     else if (this.open) {
       // Nobody owns the thread; everybody owns their own words.
       const key = op.action[kind];
@@ -261,7 +277,7 @@ export class Document {
   }
   title() { const g = this.valid.get(this.id); return g ? (g.action.genesis.title || '') : ''; }
   summary() {
-    return { id: this.id, title: this.title(), open: this.open, state: this.state(), provenance: this.provenance(),
+    return { id: this.id, title: this.title(), open: this.open, sealed: this.sealed, state: this.state(), provenance: this.provenance(),
              roles: this.roles(), report: this.report };
   }
 }
@@ -314,6 +330,7 @@ export async function verifyPage(doc = globalThis.document) {
     const r = d.report;
     const counts = `${r.seen} ops fetched, ${r.valid} valid, ${r.rejected.length} rejected`;
     if (d.owner === null) return show('bad', `Not a verifiable document: genesis missing. ${counts}.`);
+    if (d.sealed) return show('ok', `Sealed document verified in your browser: ${r.sealed} signed, encrypted operation(s). ${counts}. Contents need the read key.`);
     const embedded = doc.getElementById('loom');
     const page = embedded ? JSON.parse(embedded.textContent) : null;
     if (page && (!same(page.state, d.state()) || !same(page.provenance, d.provenance())))

@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass, field
 
 from .canon import canonical
-from .ops import own_key, verify_op, op_hash, action_kind, ROLE_ADMIN, ROLE_WRITE, build_op
+from .ops import own_key, verify_op, op_hash, action_kind, ROLE_ADMIN, ROLE_WRITE, build_op, seal_action, unseal_action
 from .store import Store, IntegrityError
 
 
@@ -15,6 +15,7 @@ from .store import Store, IntegrityError
 class Report:
     seen: int = 0
     valid: int = 0
+    sealed: int = 0      # valid ops whose content we could not read (no key)
     rejected: list[tuple[str, str]] = field(default_factory=list)
 
     def reject(self, h: str, why: str) -> None:
@@ -22,14 +23,16 @@ class Report:
 
 
 class Document:
-    def __init__(self, doc_id: str, ops: dict[str, dict]):
+    def __init__(self, doc_id: str, ops: dict[str, dict], key: bytes | None = None):
         self.id = doc_id
+        self.key = key                 # read key for a sealed document, if we hold it
         self.ops = ops                 # hash -> op, everything we were handed
         self.valid: dict[str, dict] = {}
         self.order: list[str] = []     # topological order of valid ops
         self.report = Report(seen=len(ops))
         self.owner: str | None = None
         self.open = False              # open thread: no capability table, own keys only
+        self.sealed = False            # read capability: actions are encrypted
         self._ancestors: dict[str, frozenset] = {}
         self._authorized: dict[str, bool] = {}
         self._verify()
@@ -37,14 +40,19 @@ class Document:
     # ---- loading -----------------------------------------------------
 
     @classmethod
-    def load(cls, store: Store, doc_id: str) -> "Document":
+    def load(cls, store: Store, doc_id: str, key: bytes | None = None) -> "Document":
         ops = {}
         for h in store.doc_ops(doc_id):
             try:
                 ops[h] = json.loads(store.get(h))
             except (IntegrityError, OSError, ValueError, RecursionError):
                 ops[h] = None  # recorded as seen, rejected below
-        return cls(doc_id, ops)
+        return cls(doc_id, ops, key)
+
+    @property
+    def locked(self) -> bool:
+        """Sealed and we hold no key: envelopes verify, contents do not apply."""
+        return self.sealed and self.key is None
 
     # ---- verification -------------------------------------------------
 
@@ -79,7 +87,27 @@ class Document:
             rep.reject(self.id, "genesis missing")
             return
         self.owner = structural[self.id]["author"]
-        self.open = bool(structural[self.id]["action"]["genesis"].get("open", False))
+        genesis = structural[self.id]["action"]["genesis"]
+        self.open = bool(genesis.get("open", False))
+        self.sealed = bool(genesis.get("sealed", False))
+
+        # Read capability: in a sealed document every action must be sealed, and
+        # is replaced by its decrypted inner action when we hold the key.
+        for h, op in list(structural.items()):
+            if h == self.id:
+                continue
+            kind = action_kind(op["action"])
+            if self.sealed and kind != "sealed":
+                rep.reject(h, "unsealed action in a sealed document"); del structural[h]
+            elif not self.sealed and kind == "sealed":
+                rep.reject(h, "sealed action in an unsealed document"); del structural[h]
+            elif kind == "sealed" and self.key is not None:
+                try:
+                    inner = unseal_action(self.key, op["doc"], op["author"], op["seq"], op["action"]["sealed"])
+                except ValueError as e:
+                    rep.reject(h, str(e)); del structural[h]
+                    continue
+                structural[h] = {**op, "action": inner}
 
         # Causal closure: keep ops whose deps are all present and whose lamport
         # exceeds every dep's. Sorting by (lamport, hash) is then a topo order.
@@ -142,6 +170,9 @@ class Document:
         kind = action_kind(op["action"])
         if kind == "genesis":
             ok = h == self.id
+        elif kind == "sealed":
+            ok = True  # no key: the envelope is valid, the content is unknown
+            self.report.sealed += 1
         elif self.open:
             # Nobody owns the thread; everybody owns their own words.
             ok = kind in ("set", "del") and own_key(op["author"], op["action"][kind])
@@ -216,26 +247,36 @@ class Document:
 
     def title(self) -> str:
         g = self.valid.get(self.id)
-        return g["action"]["genesis"].get("title", "") if g else ""
+        if not g:
+            return ""
+        return g["action"]["genesis"].get("title", "") or self.state().get("_title", "")
 
 
 # ---- authoring helpers ------------------------------------------------
 
-def create_document(store: Store, identity, title: str, open: bool = False) -> str:
-    from .ops import genesis_action
-    op = build_op(identity, None, 1, 1, [], genesis_action(title, open))
+def create_document(store: Store, identity, title: str, open: bool = False,
+                    key: bytes | None = None) -> str:
+    """A key makes the document sealed: the title then travels encrypted too."""
+    from .ops import genesis_action, set_action
+    op = build_op(identity, None, 1, 1, [], genesis_action("" if key else title, open, sealed=key is not None))
     h = store.put(canonical(op))
     store.add_to_doc(h, h)
+    if key:
+        append(store, identity, h, set_action("_title", title), key)
     return h
 
 
-def append(store: Store, identity, doc_id: str, action: dict) -> str:
+def append(store: Store, identity, doc_id: str, action: dict, key: bytes | None = None) -> str:
     """Build an op on the current frontier, sign it, store it. Returns its hash."""
-    doc = Document.load(store, doc_id)
+    doc = Document.load(store, doc_id, key)
     if doc.owner is None:
         raise ValueError("document has no valid genesis")
-    op = build_op(identity, doc_id, doc.next_seq(identity.id), doc.next_lamport(),
-                  doc.frontier(), action)
+    seq = doc.next_seq(identity.id)
+    if doc.sealed:
+        if key is None:
+            raise ValueError("document is sealed; read key required to write")
+        action = seal_action(key, doc_id, identity.id, seq, action)
+    op = build_op(identity, doc_id, seq, doc.next_lamport(), doc.frontier(), action)
     h = store.put(canonical(op))
     store.add_to_doc(doc_id, h)
     return h

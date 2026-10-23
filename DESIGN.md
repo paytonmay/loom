@@ -1,6 +1,6 @@
 # Loom: Technical Design
 
-Status: experiment; phases 0 to 4 and 6, the adoption track, and open threads are built. Started 2026-10-23. Author: Payton May, with Claude.
+Status: experiment; phases 0 to 6, the adoption track, and open threads are built. Started 2026-10-23. Author: Payton May, with Claude.
 
 ---
 
@@ -322,13 +322,49 @@ A message is a `set` of key `<author id>/<seq>` to `{"text": ..., "re":
 that. An author may edit or delete their own messages (last writer wins
 among their own ops) and nobody else can.
 
-### Read capability (phase 4, not yet built)
+### Read capability: sealed documents
 
-The read capability is a symmetric key. The `action` field of each op is
-encrypted with ChaCha20-Poly1305 under the document key; `deps`, `author`,
-`lamport`, and `sig` stay in the clear so relays can store and order ops
-without reading them. Sharing read access means sharing the key, out of band
-or wrapped under the recipient's ML-KEM public key.
+A genesis may carry `"sealed": true`. Every later action in that document
+must then be a `sealed` action:
+
+```
+{"sealed": {"nonce": <12 bytes, base64>, "ct": <ChaCha20-Poly1305, base64>}}
+```
+
+The ciphertext is the canonical encoding of an ordinary inner action
+(`set`, `del`, `grant` or `revoke`) encrypted under the document's 32-byte
+read key, with the op's `doc`, `author` and `seq` as associated data so a
+ciphertext cannot be lifted into another op. Everything else in the op,
+including `deps`, `lamport` and the signature, stays in the clear. The
+signature covers the ciphertext.
+
+Consequences:
+
+- A relay, a static host, and the browser verifier check every hash and
+  signature without the key. They see who wrote, when in causal order, and
+  how much. They cannot see what. Hosting a private document on a public
+  host costs nothing extra.
+- A reader without the key gets a verified skeleton: the report counts the
+  sealed ops as valid and unreadable, state is empty, and the title is empty
+  too, because a sealed document's title travels as a sealed `_title` key.
+- A reader with the key decrypts each action and then applies the normal
+  rules, including capabilities: grants and revokes are sealed like
+  everything else, so even the capability table is private.
+- A wrong key, a tampered ciphertext, or a ciphertext moved to another op
+  fails authentication and is reported as rejected, never applied.
+- An unsealed action in a sealed document is rejected, so a careless writer
+  cannot leak; a sealed action in an unsealed document is rejected, so the
+  two kinds never mix.
+
+The read key is shared out of band: `loom readkey <doc>` prints it, `loom
+readkey <doc> <hex>` imports it. Wrapping it under a recipient's ML-KEM
+public key is a later convenience, not a change to the format. Taking read
+access away is not possible, since whoever has the key has the ciphertexts:
+the honest move is a new document with a new key, which is what every
+encrypted-group design ends up doing.
+
+A published page for a sealed document holds no plaintext: `publish` loads
+the document without the key on purpose.
 
 ---
 
@@ -473,10 +509,18 @@ for each part, and what may be done with it.
 | Quantum adversary forging signatures | ML-DSA is lattice-based; Shor does not apply |
 | Harvest-now-decrypt-later on signatures | Signatures are PQ from day one |
 | Peers disagree on state | CRDT total order guarantees convergence |
+| Relay or host reads a private document | Sealed actions: ChaCha20-Poly1305 under a read key the host never sees |
+| Ciphertext tampered or moved between ops | AEAD tag plus doc/author/seq as associated data |
 | Relay or blob crafted to crash a reader | Nesting cap, float and type checks, size cap of 1 MB per blob; every malformed blob is a rejection in the report, never an exception |
 | Page content injects script | Every value is HTML-escaped; the verifier writes text only; the embedded JSON escapes `</` |
 
 ### Not defended, by design, in this phase
+
+- **Metadata of sealed documents.** Authors, causal structure, timing by
+  lamport, op sizes and the capability-op count are visible to anyone with
+  the ops. Only contents are hidden.
+- **Taking read access back.** A key, once shared, is shared. Start a new
+  document to exclude someone.
 
 - **A public `loom serve` accepts storage from anyone.** It stores any
   correctly signed op, so a stranger can fill its disk with documents of
@@ -503,7 +547,7 @@ for each part, and what may be done with it.
 - `dilithium-py` 1.5.1: pure-Python ML-DSA per FIPS 204. Chosen because it
   installs with no compiler. It is slow (tens of milliseconds per signature)
   and not side-channel hardened. Acceptable for an experiment.
-- `cryptography` 43: reserved for ChaCha20-Poly1305 in phase 4.
+- `cryptography` 43: ChaCha20-Poly1305 for sealed documents.
 - `pytest` for tests.
 
 ### Repo layout
@@ -539,7 +583,7 @@ elegant/
 | 2 | Ops + document | create, set, del, show; LWW converges from shuffled op order |
 | 3 | Capabilities | unauthorized op rejected; grant enables; revoke disables causally |
 | 4 | Sync | two peers converge through a directory relay and an HTTP relay |
-| 5 | Read capability | encrypted actions; relay sees only metadata |
+| 5 | Read capability | encrypted actions; relay sees only metadata. Done |
 | 6 | Second implementation | reads and verifies documents written by the Python one. Done in JavaScript (the browser verifier); Go remains optional |
 | 7 | Agent interface | `_schema` and `_intents`; an agent reads and acts with provenance |
 

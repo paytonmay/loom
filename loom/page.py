@@ -48,10 +48,10 @@ def render_html(doc: Document, relay_prefix: str = "loom/") -> str:
         for who, role in sorted(roles.items()))
     r = doc.report
     rejected = "".join(f"<li><code>{e(short(h))}</code>: {e(why)}</li>" for h, why in r.rejected)
-    machine = {"loom": 1, "id": doc.id, "title": doc.title(), "open": doc.open, "ops": href,
+    machine = {"loom": 1, "id": doc.id, "title": doc.title(), "open": doc.open, "sealed": doc.sealed, "ops": href,
                "state": state, "provenance": prov, "roles": roles,
                "frontier": doc.frontier(),
-               "report": {"seen": r.seen, "valid": r.valid, "rejected": r.rejected}}
+               "report": {"seen": r.seen, "valid": r.valid, "sealed": r.sealed, "rejected": r.rejected}}
     machine_json = json.dumps(machine, ensure_ascii=False, indent=1).replace("</", "<\\/")
     return f"""<!doctype html>
 <html lang="en">
@@ -75,14 +75,14 @@ def render_html(doc: Document, relay_prefix: str = "loom/") -> str:
 <div id="loom-verify">This page carries its signed source; a browser with JavaScript verifies it here, or run <code>loom verify</code> on this URL.</div>
 <h1>{e(doc.title() or "untitled")}</h1>
 <p><small>document <code>{e(doc.id)}</code><br>owner <code>{e(doc.owner or "none")}</code></small></p>
-<table>
+{f"<p><strong>Sealed.</strong> {r.sealed} operation(s) are signed and verifiable; their contents are encrypted and readable only with the document's read key. This page holds no plaintext.</p>" if doc.sealed else f"""<table>
 <thead><tr><th>key</th><th>value</th><th>by</th><th>t</th><th>op</th></tr></thead>
 <tbody>{rows}</tbody>
-</table>
+</table>"""}
 <h2>Who may write</h2>
 {"<p>This is an open thread. Nobody owns it; anyone may write, only under their own id. Nobody can silence you and nobody can speak as you.</p>" if doc.open else f"<table><tbody>{role_rows}</tbody></table>"}
 <h2>Verification</h2>
-<p>ops seen {r.seen}, valid {r.valid}, rejected {len(r.rejected)}</p>
+<p>ops seen {r.seen}, valid {r.valid}, rejected {len(r.rejected)}{f", sealed {r.sealed}" if doc.sealed else ""}</p>
 {f"<ul>{rejected}</ul>" if rejected else ""}
 <footer>
 <p>This page is a rendering, not the document. The document is the set of signed

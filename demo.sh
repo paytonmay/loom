@@ -80,6 +80,16 @@ LOOM_HOME=$A $LOOM pull $SQ http://127.0.0.1:7700 >/dev/null
 LOOM_HOME=$A $LOOM thread $SQ
 LOOM_HOME=$A $LOOM show $SQ | tail -2
 
+say "a sealed document: the relay and the page verify it, only key holders read it"
+SD=$(LOOM_HOME=$A $LOOM create "secret plans" --sealed 2>/dev/null)
+LOOM_HOME=$A $LOOM set $SD where '"the old mill"' >/dev/null
+LOOM_HOME=$A $LOOM push $SD http://127.0.0.1:7700
+LOOM_HOME=$B $LOOM pull $SD http://127.0.0.1:7700 >/dev/null
+LOOM_HOME=$B $LOOM show $SD | head -4
+say "alice hands bob the read key out of band"
+LOOM_HOME=$B $LOOM readkey $SD $(LOOM_HOME=$A $LOOM readkey $SD) >/dev/null
+LOOM_HOME=$B $LOOM show $SD | head -4
+
 say "a relay operator tampers with a stored op"
 F=$(ls demo-run/relay/blobs | head -1)
 printf '{"tampered":true}' > demo-run/relay/blobs/$F

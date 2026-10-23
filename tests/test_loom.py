@@ -517,3 +517,116 @@ def test_hostile_blobs_are_rejected_not_crashes(tmp_path, keys):
             HttpRelay(url).get("sha256:" + "0" * 64)
     finally:
         server.shutdown()
+
+
+# ---- phase 5: read capability -------------------------------------------
+
+def test_sealed_document_relay_is_blind_and_key_holders_read(tmp_path, keys):
+    from loom.ops import new_read_key, build_op
+    a, b, c = keys["alice"], keys["bob"], keys["carol"]
+    sa = Store(tmp_path / "a")
+    key = new_read_key()
+    d = create_document(sa, a, "secret plans", key=key)
+    append(sa, a, d, set_action("where", "the old mill"), key)
+    append(sa, a, d, grant_action(b.pubkey, "write"), key)      # capabilities travel sealed too
+    assert push(sa, d, DirRelay(tmp_path / "relay")) == 4       # the relay verified every envelope without a key
+
+    # no key: envelopes verify, nothing is readable, the title is hidden
+    locked = Document.load(sa, d)
+    assert locked.sealed and locked.locked and locked.state() == {} and locked.title() == ""
+    assert locked.report.valid == 4 and locked.report.sealed == 3 and not locked.report.rejected
+    # with the key
+    doc = Document.load(sa, d, key)
+    assert doc.title() == "secret plans" and doc.state()["where"] == "the old mill"
+    assert doc.roles() == {a.id: "admin", b.id: "write"}
+    # wrong key: every sealed op is rejected, the genesis stands
+    wrong = Document.load(sa, d, new_read_key())
+    assert wrong.report.valid == 1 and all("cannot unseal" in why for _, why in wrong.report.rejected)
+
+    # bob holds the key and a write grant; carol holds the key but no grant
+    sb = Store(tmp_path / "b"); pull(sb, d, DirRelay(tmp_path / "relay"))
+    append(sb, b, d, set_action("when", "midnight"), key)
+    bad = append(sb, c, d, set_action("when", "noon"), key)
+    doc = Document.load(sb, d, key)
+    assert doc.state()["when"] == "midnight" and (bad, "unauthorized") in doc.report.rejected
+    # writing without the key is refused locally, and an unsealed op smuggled in is rejected by readers
+    with pytest.raises(ValueError, match="read key required"):
+        append(sb, b, d, set_action("when", "noon"))
+    raw = build_op(b, d, 9, 99, doc.frontier(), set_action("leak", "plaintext"))
+    h = sb.put(canonical(raw)); sb.add_to_doc(d, h)
+    assert (h, "unsealed action in a sealed document") in Document.load(sb, d, key).report.rejected
+    # and a sealed op in an unsealed document is rejected as well
+    plain = create_document(sa, a, "plain")
+    from loom.ops import seal_action
+    raw = build_op(a, plain, 2, 2, [plain], seal_action(key, plain, a.id, 2, set_action("x", 1)))
+    h = sa.put(canonical(raw)); sa.add_to_doc(plain, h)
+    assert (h, "sealed action in an unsealed document") in Document.load(sa, plain).report.rejected
+
+    # tampered ciphertext fails authentication; a ciphertext moved to another op fails its binding
+    ops = {h: json.loads(sb.get(h)) for h in sb.doc_ops(d)}
+    sealed_ops = [h for h, op in ops.items() if "sealed" in op["action"]]
+    victim = ops[sealed_ops[0]]
+    ct = bytearray(__import__("base64").b64decode(victim["action"]["sealed"]["ct"])); ct[0] ^= 1
+    forged = build_op(b, d, 10, 100, doc.frontier(), {"sealed": {**victim["action"]["sealed"], "ct": __import__("base64").b64encode(bytes(ct)).decode()}})
+    h1 = sb.put(canonical(forged)); sb.add_to_doc(d, h1)
+    moved = build_op(b, d, 11, 101, doc.frontier(), victim["action"])   # valid ciphertext, wrong op
+    h2 = sb.put(canonical(moved)); sb.add_to_doc(d, h2)
+    rej = dict(Document.load(sb, d, key).report.rejected)
+    assert "cannot unseal" in rej[h1] and "cannot unseal" in rej[h2]
+
+
+def test_sealed_cli_key_exchange_and_publish_holds_no_plaintext(tmp_path, keys, capsys, monkeypatch):
+    from loom.cli import main
+    a, b = keys["alice"], keys["bob"]
+    ha, hb = tmp_path / "a", tmp_path / "b"
+    a.save(ha); b.save(hb)
+    monkeypatch.setenv("LOOM_HOME", str(ha))
+    main(["--key", "alice", "create", "diary", "--sealed"])
+    d = capsys.readouterr().out.strip().splitlines()[0]
+    main(["--key", "alice", "set", d, "mood", "quietly pleased"])
+    main(["readkey", d]); key_hex = capsys.readouterr().out.strip().splitlines()[-1]
+    main(["push", d, str(tmp_path / "relay")])
+    site = tmp_path / "site"
+    main(["publish", d, str(site), "--page", "index.html"]); capsys.readouterr()
+    page = (site / "index.html").read_text()
+    assert "quietly pleased" not in page and "diary" not in page and "Sealed" in page
+
+    # bob pulls without the key, sees envelopes only; imports the key, reads
+    monkeypatch.setenv("LOOM_HOME", str(hb))
+    main(["pull", d, str(tmp_path / "relay")])
+    main(["show", d]); out = capsys.readouterr().out
+    assert "sealed" in out and "quietly pleased" not in out
+    main(["readkey", d, key_hex]); capsys.readouterr()
+    main(["show", d]); out = capsys.readouterr().out
+    assert 'mood = "quietly pleased"' in out and '"diary"' in out
+    # verify from the folder with and without the key
+    main(["verify", str(site / "index.html")]); out = capsys.readouterr().out
+    assert "contents encrypted" in out
+    main(["verify", str(site / "index.html"), "--readkey", key_hex]); out = capsys.readouterr().out
+    assert "quietly pleased" in out
+
+
+@pytest.mark.skipif(not __import__("shutil").which("node"), reason="node not installed")
+def test_javascript_verifier_agrees_on_sealed_documents(tmp_path, keys, capsys, monkeypatch):
+    import subprocess
+    from loom.cli import main
+    from loom.ops import new_read_key, build_op
+    a, b = keys["alice"], keys["bob"]
+    home = tmp_path / "home"; a.save(home)
+    sa = Store(home / "store")
+    key = new_read_key()
+    d = create_document(sa, a, "sealed", key=key)
+    append(sa, a, d, set_action("k", "v"), key)
+    append(sa, b, d, set_action("k", "intruder"), key)          # sealed but unauthorized: only a key holder can tell
+    leak = build_op(a, d, 9, 99, [d], set_action("leak", 1))
+    h = sa.put(canonical(leak)); sa.add_to_doc(d, h)
+    monkeypatch.setenv("LOOM_HOME", str(home))
+    site = tmp_path / "site"
+    main(["publish", d, str(site)]); capsys.readouterr()
+    r = subprocess.run(["node", str(site / "loom" / "verify.js"), str(site / "loom"), d], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout)
+    py = Document.load(sa, d)   # no key, like the browser
+    assert got["sealed"] is True and got["state"] == {} == py.state()
+    assert got["report"]["valid"] == py.report.valid == 4 and got["report"]["sealed"] == py.report.sealed == 3
+    assert sorted(map(tuple, got["report"]["rejected"])) == sorted(py.report.rejected) == [(h, "unsealed action in a sealed document")]

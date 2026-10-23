@@ -62,6 +62,15 @@ An open thread has no owner. Anyone may post, only as themselves:
 ./loom.sh thread <doc>
 ```
 
+A sealed document keeps its contents private on any host:
+
+```
+./loom.sh create "diary" --sealed       # a read key is generated and kept in LOOM_HOME/readkeys
+./loom.sh set <doc> mood "fine"         # encrypted; relays, hosts and browsers verify but cannot read
+./loom.sh readkey <doc>                 # print the key to share out of band
+./loom.sh readkey <doc> <hex>           # import a key you were given, then `show` reads
+```
+
 `LOOM_HOME` picks the key and store directory (default `~/.loom`). Two peers
 on one machine use two homes.
 
